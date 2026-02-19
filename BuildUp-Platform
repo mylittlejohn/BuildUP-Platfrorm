@@ -1,0 +1,195 @@
+buildup-platform/
+├─ frontend/  (React / Next.js files)
+├─ backend/   (Node.js / Express files)
+Backend/
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+require('dotenv').config();
+
+const contractorRoutes = require('./routes/contractors');
+const homeownerRoutes = require('./routes/homeowners');
+const matchRoutes = require('./routes/matches');
+const messageRoutes = require('./routes/messages');
+const paymentRoutes = require('./routes/payments');
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+// API routes
+app.use('/api/contractors', contractorRoutes);
+app.use('/api/homeowners', homeownerRoutes);
+app.use('/api/matches', matchRoutes);
+app.use('/api/messages', messageRoutes);
+app.use('/api/payments', paymentRoutes);
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const { Pool } = require('pg');
+require('dotenv').config();
+
+const pool = new Pool({
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME
+});
+
+module.exports = pool;
+const pool = require('../db');
+const { sendLeadNotification } = require('./notifications');
+
+async function matchHomeownerToContractors(homeownerId) {
+    const homeownerRes = await pool.query(
+        'SELECT * FROM homeowners WHERE id=$1', [homeownerId]
+    );
+    const project = homeownerRes.rows[0];
+
+    const eligibleContractorsRes = await pool.query(`
+        SELECT * FROM contractors
+        WHERE checklist_completed = TRUE
+          AND status = 'Active'
+          AND $1 = ANY(trade)
+          AND (
+                base_city = $2
+                OR $2 = ANY(counties_covered)
+              )
+        ORDER BY 
+          CASE WHEN membership_tier='Gold' THEN 1
+               WHEN membership_tier='Silver' THEN 2
+               ELSE 3 END
+    `, [project.project_type, project.project_address]);
+
+    const contractors = eligibleContractorsRes.rows;
+
+    for (let contractor of contractors) {
+        const matchRes = await pool.query(
+            `INSERT INTO matches (homeowner_id, contractor_id) VALUES ($1, $2) RETURNING id`,
+            [homeownerId, contractor.id]
+        );
+        const matchId = matchRes.rows[0].id;
+
+        await sendLeadNotification(contractor.email, project.name, matchId);
+    }
+    return contractors;
+}
+
+module.exports = { matchHomeownerToContractors };
+const pool = require('../db');
+
+async function sendMessage(matchId, sender, message) {
+    const newMessage = { sender, message, timestamp: new Date() };
+    const res = await pool.query(`
+        UPDATE matches
+        SET messages = messages || $1::jsonb
+        WHERE id = $2
+        RETURNING messages
+    `, [JSON.stringify([newMessage]), matchId]);
+
+    return res.rows[0].messages;
+}
+
+async function getMessages(matchId) {
+    const res = await pool.query(`
+        SELECT messages FROM matches WHERE id = $1
+    `, [matchId]);
+    return res.rows[0].messages;
+}
+
+module.exports = { sendMessage, getMessages };
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const pool = require('../db');
+
+async function createEscrowPayment(homeownerId, contractorId, amount) {
+    const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount * 100,
+        currency: 'usd',
+        payment_method_types: ['card'],
+        metadata: {homeownerId, contractorId},
+        capture_method: 'manual', // milestone release
+    });
+
+    await pool.query(`
+        UPDATE matches
+        SET payment_milestones = payment_milestones || $1::jsonb
+        WHERE contractor_id = $2
+    `, [JSON.stringify([{intentId: paymentIntent.id, amount, status: 'pending'}]), contractorId]);
+
+    return paymentIntent.client_secret;
+}
+
+async function releasePayment(intentId) {
+    const intent = await stripe.paymentIntents.capture(intentId);
+    return intent.status;
+}
+
+module.exports = { createEscrowPayment, releasePayment };
+Frontend/
+import Link from 'next/link';
+
+export default function Home() {
+  return (
+    <div style={{ textAlign: 'center', padding: '50px' }}>
+      <h1>Welcome to BuildUp</h1>
+      <p>Select your portal:</p>
+      <Link href="/contractor">Contractor Dashboard</Link><br />
+      <Link href="/homeowner">Homeowner Dashboard</Link>
+    </div>
+  )
+}
+import { useEffect, useState } from 'react';
+
+export default function ContractorDashboard() {
+  const [leads, setLeads] = useState([]);
+
+  useEffect(() => {
+    fetch('/api/matches') // calls your backend
+      .then(res => res.json())
+      .then(data => setLeads(data));
+  }, []);
+
+  return (
+    <div style={{ padding: '20px' }}>
+      <h1>Contractor Dashboard</h1>
+      <h2>Leads</h2>
+      {leads.length === 0 ? <p>No leads yet</p> : (
+        <ul>
+          {leads.map(l => (
+            <li key={l.id}>
+              {l.project_type} - {l.project_address} - Status: {l.lead_status}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+import { useState } from 'react';
+
+export default function HomeownerDashboard() {
+  const [project, setProject] = useState({});
+
+  const submitProject = async (e) => {
+    e.preventDefault();
+    await fetch('/api/homeowners', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(project)
+    });
+    alert('Project submitted!');
+  }
+
+  return (
+    <div style={{ padding: '20px' }}>
+      <h1>Homeowner Dashboard</h1>
+      <form onSubmit={submitProject}>
+        <input placeholder="Project Type" onChange={e => setProject({...project, project_type: e.target.value})}/><br/>
+        <input placeholder="Address" onChange={e => setProject({...project, project_address: e.target.value})}/><br/>
+        <input placeholder="Budget" onChange={e => setProject({...project, budget_min: e.target.value})}/><br/>
+        <button type="submit">Submit Project</button>
+      </form>
+    </div>
+  )
+}
